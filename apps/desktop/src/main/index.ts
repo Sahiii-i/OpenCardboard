@@ -1,6 +1,9 @@
 import { app, BrowserWindow, Menu, protocol, session, shell } from 'electron';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { createReadStream } from 'node:fs';
+import { stat } from 'node:fs/promises';
+import { Readable } from 'node:stream';
+import { parseByteRange } from './byte-range.ts';
 import { getDb, closeDb } from './db.ts';
 import { getPaths } from './paths.ts';
 import { jobs } from './jobs.ts';
@@ -280,6 +283,21 @@ function buildMenu(): void {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+function mimeFor(filePath: string): string {
+  const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+  return ext === 'mp4' || ext === 'm4v' ? 'video/mp4'
+    : ext === 'mov' ? 'video/quicktime'
+    : ext === 'webm' ? 'video/webm'
+    : ext === 'mkv' ? 'video/x-matroska'
+    : ext === 'png' ? 'image/png'
+    : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+    : ext === 'mp3' ? 'audio/mpeg'
+    : ext === 'wav' ? 'audio/wav'
+    : ext === 'm4a' ? 'audio/mp4'
+    : ext === 'gif' ? 'image/gif'
+    : 'application/octet-stream';
+}
+
 function registerMediaProtocol(): void {
   protocol.handle('cbmedia', async (request) => {
     try {
@@ -290,30 +308,32 @@ function registerMediaProtocol(): void {
       if (!filePath.startsWith('/') && !/^[a-zA-Z]:\\/.test(filePath)) {
         return new Response('Invalid path', { status: 400 });
       }
-      const fileUrl = pathToFileURL(filePath).href;
-      const { net } = await import('electron');
-      const res = await net.fetch(fileUrl);
-      // explicit content-type + CORS so crossOrigin=anonymous media elements (and canvas
-      // readback in the compositor) work from any window
-      const headers = new Headers(res.headers);
-      if (!headers.has('content-type')) {
-        const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
-        const mime =
-          ext === 'mp4' || ext === 'm4v' ? 'video/mp4'
-          : ext === 'mov' ? 'video/quicktime'
-          : ext === 'webm' ? 'video/webm'
-          : ext === 'mkv' ? 'video/x-matroska'
-          : ext === 'png' ? 'image/png'
-          : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
-          : ext === 'mp3' ? 'audio/mpeg'
-          : ext === 'wav' ? 'audio/wav'
-          : ext === 'm4a' ? 'audio/mp4'
-          : ext === 'gif' ? 'image/gif'
-          : 'application/octet-stream';
-        headers.set('content-type', mime);
+      // Serve byte ranges ourselves. Media elements seek by requesting ranges; answering
+      // every request with the whole file leaves a <video> unseekable, so a "seek" just
+      // waits for the stream to reach that point and preview/export draw stale frames.
+      let size: number;
+      try {
+        size = (await stat(filePath)).size;
+      } catch {
+        return new Response('Not found', { status: 404 });
       }
-      headers.set('access-control-allow-origin', '*');
-      return new Response(res.body, { status: res.status, headers });
+      const headers = new Headers({
+        'content-type': mimeFor(filePath),
+        'accept-ranges': 'bytes',
+        // CORS so crossOrigin=anonymous media elements (and canvas readback in the
+        // compositor) work from any window
+        'access-control-allow-origin': '*',
+      });
+      const range = parseByteRange(request.headers.get('range'), size);
+      if (range === 'unsatisfiable') {
+        headers.set('content-range', `bytes */${size}`);
+        return new Response(null, { status: 416, headers });
+      }
+      const { start, end } = range ?? { start: 0, end: size - 1 };
+      headers.set('content-length', String(end - start + 1));
+      if (range) headers.set('content-range', `bytes ${start}-${end}/${size}`);
+      const body = size === 0 ? null : (Readable.toWeb(createReadStream(filePath, { start, end })) as ReadableStream);
+      return new Response(body, { status: range ? 206 : 200, headers });
     } catch (err) {
       return new Response(`cbmedia error: ${err instanceof Error ? err.message : String(err)}`, { status: 500 });
     }
