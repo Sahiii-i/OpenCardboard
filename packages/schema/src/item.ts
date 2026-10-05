@@ -90,6 +90,12 @@ export const itemPropsSchemas = {
     style: captionStyleSchema,
     mode: z.enum(['word', 'phrase']).default('phrase'),
     maxWordsPerCard: z.number().int().positive().default(5),
+    /**
+     * How word times are measured. 'item': ms from the card's own start (plus its
+     * sourceInFrame), so a card stays in sync when it is moved, split or trimmed.
+     * Absent: legacy cards, whose word times are compared against the timeline clock.
+     */
+    clock: z.enum(['item']).optional(),
   }),
   shape: shapePropsSchema,
   /** Code is validated + sandboxed at runtime (main prompt §7); stored verbatim here. */

@@ -16,6 +16,7 @@ import {
   isAudioBearing,
   itemEnd,
   MEDIA_TYPES,
+  hasSourceClock,
   requireItem,
   requireTrack,
   trackAllowsItem,
@@ -454,7 +455,7 @@ function computeTrim(doc: TimelineDoc, op: TrimSpec) {
   if (track.locked) throw new OpError(`Track "${track.name}" is locked.`, 'Unlock the track first.');
   const oldStart = item.startFrame;
   const oldEnd = itemEnd(item);
-  const isMedia = MEDIA_TYPES.includes(item.type);
+  const isMedia = hasSourceClock(item);
   const oldSourceIn = item.sourceInFrame ?? 0;
 
   let newStart = oldStart;
@@ -557,7 +558,7 @@ function applyItemSplit(
     id: op.newItemId,
     startFrame: op.atFrame,
     durationFrames: item.durationFrames - splitLocal,
-    sourceInFrame: MEDIA_TYPES.includes(item.type)
+    sourceInFrame: hasSourceClock(item)
       ? (item.sourceInFrame ?? 0) + Math.round(splitLocal * item.speed)
       : item.sourceInFrame,
     timeRemap: item.timeRemap

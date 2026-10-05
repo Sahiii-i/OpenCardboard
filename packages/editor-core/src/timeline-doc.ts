@@ -32,6 +32,28 @@ export const TRACK_KIND_ALLOWED: Record<TrackKind, readonly ItemType[]> = {
 
 export const MEDIA_TYPES: readonly ItemType[] = ['video', 'audio'];
 
+/** Captions on the item clock carry their own source offset, like media items. */
+function isItemClockCaption(item: Item): boolean {
+  return item.type === 'caption' && (item.props as { clock?: string } | undefined)?.clock === 'item';
+}
+
+/** Items whose sourceInFrame advances when their head is trimmed or they are split. */
+export function hasSourceClock(item: Item): boolean {
+  return MEDIA_TYPES.includes(item.type) || isItemClockCaption(item);
+}
+
+/**
+ * The clock a caption's word times are compared against at a timeline frame.
+ * Item-clock cards count from their own start plus sourceInFrame; legacy cards use
+ * the timeline clock.
+ */
+export function captionClockMs(item: Item, frame: number, fps: number): number {
+  const localFrame = isItemClockCaption(item)
+    ? frame - item.startFrame + (item.sourceInFrame ?? 0)
+    : frame;
+  return Math.round((localFrame / fps) * 1000);
+}
+
 export function trackAllowsItem(trackKind: TrackKind, itemType: ItemType): boolean {
   return TRACK_KIND_ALLOWED[trackKind].includes(itemType);
 }

@@ -50,6 +50,12 @@ function wordsForItem(snapshot: Snapshot, item: Item): { w: string; startFrame: 
   return out.filter((w) => w.endFrame > item.startFrame && w.startFrame < itemEnd(item));
 }
 
+/** Timeline position (ms, unrounded) of a source-clip time inside a media item. */
+function timelineMsOf(item: Item, sourceMs: number, fps: number): number {
+  const sourceInMs = ((item.sourceInFrame ?? 0) / fps) * 1000;
+  return (item.startFrame / fps) * 1000 + (sourceMs - sourceInMs) / item.speed;
+}
+
 function speechItems(snapshot: Snapshot, itemIds?: string[]): Item[] {
   const items = snapshot.doc.items.filter(
     (i) => (itemIds ? itemIds.includes(i.id) : true) && (i.type === 'video' || i.type === 'audio'),
@@ -139,6 +145,12 @@ export const addCaptions: ToolDef = {
         const nextCard = words[i + input.wordsPerCard];
         const end = Math.min(itemEnd(item), Math.max(card[card.length - 1]!.endFrame, nextCard ? nextCard.startFrame - 1 : card[card.length - 1]!.endFrame + pad));
         if (end - start < 1) continue;
+        // Word times on the card's own clock: where each word lands on the timeline,
+        // measured from the card start. Transcript ms are source-clip time, so using them
+        // directly desyncs every card after a cut or a sourceInFrame offset.
+        const cardStartMs = (start / fps) * 1000;
+        const toCardMs = (sourceMs: number) =>
+          Math.max(0, Math.round(timelineMsOf(item, sourceMs, fps) - cardStartMs));
         ops.push({
           type: 'item.add',
           item: {
@@ -148,7 +160,14 @@ export const addCaptions: ToolDef = {
             startFrame: start,
             durationFrames: end - start,
             transform: { x: 0, y: 0, scale: 1, scaleX: 1, scaleY: 1, rotation: 0, opacity: 1 },
-            props: { words: card.map((w) => ({ w: w.w, startMs: w.startMs, endMs: w.endMs })), style, mode: 'phrase', maxWordsPerCard: input.wordsPerCard },
+            sourceInFrame: 0,
+            props: {
+              words: card.map((w) => ({ w: w.w, startMs: toCardMs(w.startMs), endMs: toCardMs(w.endMs) })),
+              style,
+              mode: 'phrase',
+              maxWordsPerCard: input.wordsPerCard,
+              clock: 'item',
+            },
             labels: { name: card.map((w) => w.w).join(' ').slice(0, 24) },
           } as never,
         });
@@ -339,4 +358,4 @@ export const duckMusic: ToolDef = {
 export const MACRO_TOOLS: ToolDef[] = [addCaptions, removeSilences, buildRoughCut, duckMusic];
 
 // re-export for tests
-export { wordsForItem, cutSpansOps, sourceFrameAt, itemsOnTrack };
+export { wordsForItem, cutSpansOps, timelineMsOf, sourceFrameAt, itemsOnTrack };

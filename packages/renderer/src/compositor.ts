@@ -1,6 +1,6 @@
 import { CaptionStyle, Item, TimelineDoc, TextStyle } from '@cutboard/schema';
 import type { MotionNode } from './motion.ts';
-import { itemEnd, sourceFrameAt, itemsOnTrack } from '@cutboard/editor-core';
+import { captionClockMs, itemEnd, sourceFrameAt, itemsOnTrack } from '@cutboard/editor-core';
 import { effectsToFilter } from './effects.ts';
 import { itemOpacityAt, resolveItemProperty } from './keyframes.ts';
 import { DrawableSource, DrawOptions, MediaResolver, drawableSize } from './types.ts';
@@ -275,7 +275,7 @@ function drawCaption(
   rotation: number,
 ): void {
   const fps = doc.project.fps;
-  const timeMs = Math.round((frame / fps) * 1000);
+  const timeMs = captionClockMs(item, frame, fps);
   const { words, style, maxWordsPerCard } = props;
   const activeIdx = words.findIndex((w) => timeMs >= w.startMs && timeMs < w.endMs);
   if (activeIdx === -1 && words.length > 0 && timeMs < words[0]!.startMs) return;
