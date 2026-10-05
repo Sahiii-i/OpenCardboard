@@ -8,7 +8,11 @@ import { mediaUrl } from './url.ts';
  * resolver handles the paused/scrub path where every frame must be exact.
  */
 
-export function seekTo(el: HTMLVideoElement | HTMLAudioElement, seconds: number): Promise<void> {
+export function seekTo(
+  el: HTMLVideoElement | HTMLAudioElement,
+  seconds: number,
+  opts: { timeoutMs?: number } = {},
+): Promise<void> {
   if (!Number.isFinite(seconds)) return Promise.resolve();
   const target = Math.max(0, seconds);
   if (Math.abs(el.currentTime - target) < 0.004) return Promise.resolve();
@@ -22,12 +26,15 @@ export function seekTo(el: HTMLVideoElement | HTMLAudioElement, seconds: number)
       el.removeEventListener('seeked', done);
       resolve();
     };
-    // Events (seeked/loadeddata) are unreliable in hidden windows, so poll currentTime
-    // and cap the wait; drawing happens after whichever comes first.
+    // currentTime reads back as the target the instant it is set, long before the frame
+    // is decoded, so it cannot signal completion: drawing then reuses the previous frame
+    // (frozen video, worst on long-GOP 4K HEVC). Wait for `seeked`, the point at which the
+    // new frame is available to drawImage. The poll only catches a seeked event that was
+    // missed, and only once the element reports it is no longer seeking.
     const poll = setInterval(() => {
-      if (Math.abs(el.currentTime - target) < 0.002) done();
+      if (!el.seeking && el.readyState >= 2 && Math.abs(el.currentTime - target) < 0.002) done();
     }, 16);
-    const cap = setTimeout(done, 400);
+    const cap = setTimeout(done, opts.timeoutMs ?? 3000);
     el.addEventListener('seeked', done);
     el.currentTime = target;
   });
@@ -74,15 +81,37 @@ export class MediaPool implements MediaResolver {
     return this.motionHost.evaluate(code, props, frame, videoConfig);
   }
 
+  /** Assets whose full-quality file could not be decoded here; they render from the proxy. */
+  private readonly originalFailed = new Set<string>();
+
   constructor(
     private readonly assets: Map<string, { proxyPath?: string; path: string; kind: string; fps?: number }>,
     private readonly projectFps: number,
+    private readonly opts: { preferOriginal?: boolean } = {},
   ) {}
+
+  private usesOriginal(assetId: string): boolean {
+    const asset = this.assets.get(assetId);
+    return Boolean(
+      this.opts.preferOriginal && asset && asset.kind !== 'image' && asset.proxyPath && !this.originalFailed.has(assetId),
+    );
+  }
 
   resolveMediaUrl(assetId: string): string | null {
     const asset = this.assets.get(assetId);
     if (!asset) return null;
+    if (this.usesOriginal(assetId)) return mediaUrl(asset.path);
     return mediaUrl(asset.proxyPath ?? asset.path);
+  }
+
+  /** Swap a video element that failed on the original over to the proxy. */
+  private fallBackToProxy(assetId: string, el: HTMLVideoElement): void {
+    const asset = this.assets.get(assetId);
+    if (!asset?.proxyPath || this.originalFailed.has(assetId)) return;
+    this.originalFailed.add(assetId);
+    this.loadedOnce.delete(assetId);
+    console.warn(`[export] full-quality file not decodable, using proxy for ${assetId}`);
+    el.src = mediaUrl(asset.proxyPath);
   }
 
   /** Keep the pool in sync as assets are imported/analyzed (proxyPath appears later). */
@@ -98,6 +127,10 @@ export class MediaPool implements MediaResolver {
     const url = this.resolveMediaUrl(assetId);
     if (!url) return null;
     el = document.createElement('video');
+    if (this.usesOriginal(assetId)) {
+      const video = el;
+      video.addEventListener('error', () => this.fallBackToProxy(assetId, video), { once: true });
+    }
     el.src = url;
     el.muted = true; // preview audio is handled by the audio pool
     el.preload = 'auto';
@@ -179,11 +212,18 @@ export class MediaPool implements MediaResolver {
               resolve();
             }
           }, 16);
+          // full-quality files take longer to open than the 540p proxy
           const cap = setTimeout(() => {
             clearInterval(poll);
             resolve();
-          }, 6000);
+          }, this.usesOriginal(assetId) ? 30000 : 6000);
         });
+      }
+      if (el.videoWidth === 0 && this.usesOriginal(assetId)) {
+        // the full-quality file never produced a frame (codec Chromium cannot decode): retry on the proxy
+        this.fallBackToProxy(assetId, el);
+        this.pending.delete(key); // let the retry start fresh instead of awaiting itself
+        return this.getVisual(assetId, sourceFrame, _item);
       }
       this.loadedOnce.add(assetId);
       // source frames are in project-fps timebase (docs/DECISIONS.md)

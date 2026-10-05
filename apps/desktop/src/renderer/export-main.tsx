@@ -35,18 +35,30 @@ async function main(): Promise<void> {
     const bundle = (await window.cutboard.exportBundle(exportId)) as {
       doc: TimelineDoc;
       mediaUrls: Record<string, string>;
+      media?: Record<string, { path: string; proxyPath?: string }>;
     };
     const doc = bundle.doc;
     const totalFrames = docDurationFrames(doc);
     if (totalFrames === 0) throw new Error('Nothing to render');
 
-    const assets = Object.entries(bundle.mediaUrls).map(([id, path]) => ({
-      id,
-      path,
-      kind: doc.items.find((i) => i.assetId === id)?.type === 'image' ? 'image' : 'video',
-      proxyPath: path,
-    }));
-    const pool = new MediaPool(new Map(assets.map((a) => [a.id, { proxyPath: a.proxyPath, path: a.path, kind: a.kind }])), fps);
+    // Full exports decode the full-quality render copy prepared by the export service
+    // (the proxy is a 540p preview copy and upscaling it shows as blocks); still captures
+    // keep the fast proxy.
+    const isStill = stillFrame !== null;
+    const assets = Object.entries(bundle.mediaUrls).map(([id, proxyFirst]) => {
+      const info = bundle.media?.[id];
+      return {
+        id,
+        path: info?.path ?? proxyFirst,
+        kind: doc.items.find((i) => i.assetId === id)?.type === 'image' ? 'image' : 'video',
+        proxyPath: info ? info.proxyPath : proxyFirst,
+      };
+    });
+    const pool = new MediaPool(
+      new Map(assets.map((a) => [a.id, { proxyPath: a.proxyPath, path: a.path, kind: a.kind }])),
+      fps,
+      { preferOriginal: !isStill },
+    );
     const compositor = new CanvasCompositor();
     const canvas = new OffscreenCanvas(settings.width, settings.height);
     const ctx = canvas.getContext('2d')!;

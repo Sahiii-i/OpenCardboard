@@ -213,6 +213,49 @@ export async function makeProxy(
   });
 }
 
+/**
+ * Export-grade copy of a video: every frame a keyframe (-g 1) so a seek lands on the exact
+ * frame, long edge scaled to the export size (never upscaled), colour handled the same way
+ * as the proxy. Video only; the export mixes audio from the original.
+ */
+export async function makeRenderMedia(
+  src: string,
+  dest: string,
+  opts: { longEdge: number; onProgress?: (t: number, d: number) => void; signal?: AbortSignal; durationMs?: number },
+): Promise<void> {
+  const { h264Encoder } = getFfmpeg();
+  const L = opts.longEdge;
+  // intra-only frames need far more bits than the 1.5 Mb/s proxy to stay clean
+  const encArgs: Record<string, string[]> = {
+    libx264: ['-crf', '16', '-preset', 'veryfast'],
+    mpeg4: ['-q:v', '2'],
+  };
+  const args = [
+    '-i', src,
+    '-vf', `scale='if(gt(iw,ih),min(${L},iw),-2)':'if(gt(iw,ih),-2,min(${L},ih))'`,
+    '-c:v', h264Encoder,
+    ...(encArgs[h264Encoder] ?? ['-b:v', '40M']),
+    '-g', '1',
+    '-pix_fmt', 'yuv420p',
+    '-an',
+    '-movflags', '+faststart',
+    '-progress', 'pipe:2', '-nostats',
+    dest,
+  ];
+  const result = await runFfmpeg(args, {
+    signal: opts.signal,
+    onStderr: (text) => {
+      const m = /out_time_ms=(\d+)/.exec(text);
+      if (m && opts.durationMs && opts.onProgress) {
+        opts.onProgress(Number(m[1]) / 1000, opts.durationMs);
+      }
+    },
+  });
+  if (result.code !== 0 && !opts.signal?.aborted) {
+    throw new Error(`render copy failed: ${result.stderr.split('\n').slice(-3).join(' | ')}`);
+  }
+}
+
 export async function makeThumbnail(src: string, dest: string, atSec = 1): Promise<void> {
   await runFfmpeg([
     '-ss', String(atSec),

@@ -1,7 +1,10 @@
 import { BrowserWindow, ipcMain } from 'electron';
+import { existsSync } from 'node:fs';
+import { rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import { getDb } from './db.ts';
-import { runFfmpeg, getFfmpeg } from './ffmpeg.ts';
+import { runFfmpeg, getFfmpeg, makeRenderMedia } from './ffmpeg.ts';
+import { normalizeLoudness } from './loudness.ts';
 import { projectService } from './project-service.ts';
 import { getAsset } from './asset-service.ts';
 import { Item, TimelineDoc, newId } from '@cutboard/schema';
@@ -20,14 +23,16 @@ export interface ExportPreset {
   height: number;
   format: 'mp4' | 'webm';
   videoBitrateK: number;
+  /** Integrated loudness target for the final mix; omit to leave the mix untouched. */
+  loudnessLufs?: number;
 }
 
 export const EXPORT_PRESETS: ExportPreset[] = [
-  { name: 'TikTok / Reels / Shorts', width: 1080, height: 1920, format: 'mp4', videoBitrateK: 12000 },
-  { name: 'YouTube 1080p', width: 1920, height: 1080, format: 'mp4', videoBitrateK: 12000 },
-  { name: 'Square 1080', width: 1080, height: 1080, format: 'mp4', videoBitrateK: 10000 },
-  { name: '1440p', width: 2560, height: 1440, format: 'mp4', videoBitrateK: 20000 },
-  { name: 'WebM 1080p', width: 1920, height: 1080, format: 'webm', videoBitrateK: 10000 },
+  { name: 'TikTok / Reels / Shorts', width: 1080, height: 1920, format: 'mp4', videoBitrateK: 12000, loudnessLufs: -14 },
+  { name: 'YouTube 1080p', width: 1920, height: 1080, format: 'mp4', videoBitrateK: 12000, loudnessLufs: -14 },
+  { name: 'Square 1080', width: 1080, height: 1080, format: 'mp4', videoBitrateK: 10000, loudnessLufs: -14 },
+  { name: '1440p', width: 2560, height: 1440, format: 'mp4', videoBitrateK: 20000, loudnessLufs: -14 },
+  { name: 'WebM 1080p', width: 1920, height: 1080, format: 'webm', videoBitrateK: 10000, loudnessLufs: -14 },
 ];
 
 export interface ExportRow {
@@ -56,7 +61,15 @@ function emit(row: ExportRow): void {
 class ExportService {
   private active = new Map<
     string,
-    { controller: AbortController; window: BrowserWindow | null; totalFrames: number; doneFrames: number; stdin: NodeJS.WritableStream | null }
+    {
+      controller: AbortController;
+      window: BrowserWindow | null;
+      totalFrames: number;
+      doneFrames: number;
+      stdin: NodeJS.WritableStream | null;
+      /** assetId -> all-keyframe render copy used by the export window */
+      renderMedia: Map<string, string>;
+    }
   >();
 
   async start(presetName: string): Promise<ExportRow> {
@@ -79,8 +92,33 @@ class ExportService {
     emit(row);
 
     const controller = new AbortController();
-    const state = { controller, window: null as BrowserWindow | null, totalFrames, doneFrames: 0, stdin: null as NodeJS.WritableStream | null };
+    const state = {
+      controller,
+      window: null as BrowserWindow | null,
+      totalFrames,
+      doneFrames: 0,
+      stdin: null as NodeJS.WritableStream | null,
+      renderMedia: new Map<string, string>(),
+    };
     this.active.set(id, state);
+    // Render copies can take a while on 4K sources, so the export runs in the background;
+    // callers poll getExportStatus.
+    void this.run(id, doc, preset, outputPath, state).catch((err) => {
+      this.fail(id, err instanceof Error ? err.message : String(err));
+    });
+    return row;
+  }
+
+  private async run(
+    id: string,
+    doc: TimelineDoc,
+    preset: ExportPreset,
+    outputPath: string,
+    state: { controller: AbortController; window: BrowserWindow | null; renderMedia: Map<string, string> },
+  ): Promise<void> {
+    const { controller } = state;
+    await this.prepareRenderMedia(id, doc, preset, state.renderMedia, controller.signal);
+    if (controller.signal.aborted) return;
 
     // prepare ffmpeg: video from raw RGBA frames on stdin + audio filter_complex
     const ffmpegReady = this.spawnEncoder(id, doc, preset, outputPath, controller).catch((err) => {
@@ -124,7 +162,42 @@ class ExportService {
       if (this.active.has(id)) this.fail(id, 'Render window closed unexpectedly');
     });
     void ffmpegReady;
-    return row;
+  }
+
+  /**
+   * Seeking a <video> element on long-GOP footage (iPhone HEVC, most phone and camera
+   * files) lands on the nearest keyframe in the hidden export window, so frames between
+   * keyframes repeat and the export looks frozen. Each video asset gets a cached
+   * all-keyframe H.264 copy, sized for this export, which seeks exactly. The 540p preview
+   * proxy is never used for output.
+   */
+  private async prepareRenderMedia(
+    id: string,
+    doc: TimelineDoc,
+    preset: ExportPreset,
+    out: Map<string, string>,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const assetIds = [...new Set(doc.items.filter((i) => i.type === 'video' && i.assetId).map((i) => i.assetId!))];
+    const longEdge = Math.max(preset.width, preset.height);
+    for (const [n, assetId] of assetIds.entries()) {
+      const asset = getAsset(assetId);
+      if (!asset || asset.kind !== 'video') continue;
+      const dest = join(projectService.dir, 'cache', `${asset.id}-render-${longEdge}.mp4`);
+      if (!existsSync(dest)) {
+        const tmp = `${dest}.tmp.mp4`;
+        await makeRenderMedia(asset.path, tmp, {
+          longEdge,
+          signal,
+          durationMs: asset.durationMs,
+          onProgress: (done, total) =>
+            this.update(id, { status: 'rendering', progress: 0.1 * ((n + done / Math.max(1, total)) / assetIds.length) }),
+        });
+        if (signal.aborted) return;
+        await rename(tmp, dest);
+      }
+      out.set(asset.id, dest);
+    }
   }
 
   /** Called from IPC by the hidden window's export script. */
@@ -136,7 +209,11 @@ class ExportService {
     void height;
     state.stdin.write(Buffer.from(buffer));
     state.doneFrames = index + 1;
-    this.update(exportId, { status: 'rendering', progress: 0.9 * ((index + 1) / state.totalFrames) });
+    this.update(exportId, { status: 'rendering', progress: 0.1 + 0.8 * ((index + 1) / state.totalFrames) });
+  }
+
+  renderMediaFor(exportId: string, assetId: string): string | undefined {
+    return this.active.get(exportId)?.renderMedia.get(assetId);
   }
 
   handleFramesDone(exportId: string): void {
@@ -286,6 +363,17 @@ class ExportService {
     if (result.code !== 0 && !controller.signal.aborted) {
       throw new Error(`ffmpeg exited with ${result.code}: ${result.stderr.split('\n').slice(-4).join(' | ')}`);
     }
+    if (!controller.signal.aborted && audioItems.length > 0 && preset.loudnessLufs !== undefined) {
+      this.update(exportId, { status: 'encoding', progress: 0.99 });
+      const level = await normalizeLoudness(outputPath, {
+        targetLufs: preset.loudnessLufs,
+        audioCodec: preset.format === 'webm' ? 'libopus' : 'aac',
+        signal: controller.signal,
+      });
+      if (level) {
+        process.stderr.write(`[export] ${exportId} loudness ${level.integratedLufs.toFixed(1)} LUFS, peak ${level.truePeakDb.toFixed(1)} dBTP\n`);
+      }
+    }
     if (!controller.signal.aborted) {
       this.active.delete(exportId);
       this.update(exportId, { status: 'done', progress: 1, outputPath });
@@ -395,13 +483,20 @@ export function registerExportWindowIpc(): void {
     if (!projectService.isOpen) throw new Error('No project open');
     const doc = projectService.doc;
     const mediaUrls = new Map<string, string>();
+    const media = new Map<string, { path: string; proxyPath?: string }>();
     for (const item of doc.items) {
       if (item.assetId && !mediaUrls.has(item.assetId)) {
         const asset = getAsset(item.assetId);
-        if (asset) mediaUrls.set(item.assetId, asset.proxyPath ?? asset.path);
+        if (asset) {
+          mediaUrls.set(item.assetId, asset.proxyPath ?? asset.path);
+          const renderPath = exportService.renderMediaFor(exportId, item.assetId);
+          media.set(item.assetId, { path: renderPath ?? asset.path, proxyPath: asset.proxyPath });
+        }
       }
     }
-    return { doc, mediaUrls: Object.fromEntries(mediaUrls) };
+    // `media` points the export window at the render copy (proxy kept as a fallback);
+    // `mediaUrls` (proxy first) stays for still captures and older callers.
+    return { doc, mediaUrls: Object.fromEntries(mediaUrls), media: Object.fromEntries(media) };
   });
   ipcMain.on('export:window:frame', (_e, exportId: string, index: number, buffer: ArrayBuffer, width: number, height: number) => {
     if (exportId.startsWith('still-')) {
